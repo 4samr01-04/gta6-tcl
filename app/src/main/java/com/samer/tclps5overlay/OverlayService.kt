@@ -7,19 +7,23 @@ import android.graphics.PixelFormat
 import android.os.IBinder
 import android.view.Gravity
 import android.view.WindowManager
-import android.webkit.JavascriptInterface
-import android.webkit.WebView
 import android.widget.TextView
+import org.json.JSONObject
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.net.HttpURLConnection
+import java.net.URL
 
 class OverlayService : Service() {
     private var windowManager: WindowManager? = null
     private var subtitleView: TextView? = null
-    private var bridgeWebView: WebView? = null
+    private var activeConn: HttpURLConnection? = null
+    @Volatile private var isRunning = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val code = intent?.getStringExtra("PAIRING_CODE") ?: return START_NOT_STICKY
         setupOverlay()
-        connectPeerBridge(code)
+        startStream(code)
         return START_STICKY
     }
 
@@ -55,59 +59,73 @@ class OverlayService : Service() {
         subtitleView = tv
     }
 
-    private fun connectPeerBridge(code: String) {
-        bridgeWebView?.destroy()
-        val wv = WebView(this).apply {
-            settings.javaScriptEnabled = true
-            settings.domStorageEnabled = true
-            addJavascriptInterface(object {
-                @JavascriptInterface
-                fun onConnected() {
-                    subtitleView?.post { subtitleView?.text = "متصل بالجوال • جاهز لترجمة GTA 6" }
-                }
+    private fun startStream(code: String) {
+        isRunning = false
+        try { activeConn?.disconnect() } catch (_: Exception) {}
+        isRunning = true
 
-                @JavascriptInterface
-                fun onSubtitle(arabicText: String) {
-                    subtitleView?.post { subtitleView?.text = arabicText }
-                }
-
-                @JavascriptInterface
-                fun onStyle(fontSize: Float, opacity: Int, colorHex: String) {
-                    subtitleView?.post {
-                        subtitleView?.textSize = fontSize
-                        try { subtitleView?.setTextColor(Color.parseColor(colorHex)) } catch (_: Exception) {}
-                        subtitleView?.setBackgroundColor(Color.argb((opacity * 255) / 100, 0, 0, 0))
+        Thread {
+            while (isRunning) {
+                try {
+                    val url = URL("https://ntfy.sh/gta6tcl-$code/json")
+                    val conn = (url.openConnection() as HttpURLConnection).apply {
+                        requestMethod = "GET"
+                        connectTimeout = 10000
+                        readTimeout = 0
+                    }
+                    activeConn = conn
+                    val reader = BufferedReader(InputStreamReader(conn.inputStream, "UTF-8"))
+                    var line: String?
+                    while (isRunning && reader.readLine().also { line = it } != null) {
+                        val raw = line?.trim() ?: continue
+                        if (raw.isEmpty()) continue
+                        val outer = JSONObject(raw)
+                        when (outer.optString("event")) {
+                            "open" -> subtitleView?.post {
+                                subtitleView?.text = "متصل بالجوال • جاهز لترجمة GTA 6"
+                            }
+                            "message" -> {
+                                val msg = outer.optString("message")
+                                if (msg.isNotEmpty()) {
+                                    val payload = JSONObject(msg)
+                                    when (payload.optString("type")) {
+                                        "subtitle" -> {
+                                            val ar = payload.optString("ar")
+                                            if (ar.isNotEmpty()) {
+                                                subtitleView?.post { subtitleView?.text = ar }
+                                            }
+                                        }
+                                        "style" -> {
+                                            val fs = payload.optDouble("fontSize", 26.0).toFloat()
+                                            val op = payload.optInt("bgOpacity", 70)
+                                            val col = payload.optString("textColor", "#FFFFFF")
+                                            subtitleView?.post {
+                                                subtitleView?.textSize = fs
+                                                try { subtitleView?.setTextColor(Color.parseColor(col)) } catch (_: Exception) {}
+                                                subtitleView?.setBackgroundColor(Color.argb((op * 255) / 100, 0, 0, 0))
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    reader.close()
+                } catch (_: Exception) {
+                    if (isRunning) {
+                        try { Thread.sleep(2000) } catch (_: Exception) {}
                     }
                 }
-            }, "AndroidOverlay")
-        }
-
-        val html = """
-            <!doctype html><html><head>
-            <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
-            </head><body><script>
-              const peer = new Peer();
-              peer.on('open', () => {
-                const conn = peer.connect('ps5-gta6-tcl-$code');
-                conn.on('open', () => AndroidOverlay.onConnected());
-                conn.on('data', (p) => {
-                  if (p && p.type === 'subtitle') AndroidOverlay.onSubtitle(p.ar || '');
-                  if (p && p.type === 'style') AndroidOverlay.onStyle(Number(p.fontSize || 26), Number(p.bgOpacity || 70), p.textColor || '#FFFFFF');
-                });
-              });
-            </script></body></html>
-        """.trimIndent()
-
-        wv.loadDataWithBaseURL("https://peer.local/", html, "text/html", "UTF-8", null)
-        bridgeWebView = wv
+            }
+        }.start()
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        isRunning = false
+        try { activeConn?.disconnect() } catch (_: Exception) {}
         subtitleView?.let { windowManager?.removeView(it) }
-        bridgeWebView?.destroy()
         subtitleView = null
-        bridgeWebView = null
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
