@@ -75,7 +75,7 @@ class OverlayService : Service() {
                     }
                     activeConn = conn
                     val reader = BufferedReader(InputStreamReader(conn.inputStream, "UTF-8"))
-                    var line: String?
+                   var line: String? = null
                     while (isRunning && reader.readLine().also { line = it } != null) {
                         val raw = line?.trim() ?: continue
                         if (raw.isEmpty()) continue
